@@ -4,4 +4,4 @@ focus: trace
 weight: 1
 ---
 
-analysis.md recommends a request-scoped memo and/or Sheets Advanced Service batchGet with a per-sheet fallback, and states the resulting sheet-read round trips for home_ as 1 (or 4 for memo-only).
+analysis.md recommends a request-scoped memo and/or Sheets Advanced Service batchGet with a per-sheet fallback, and states the resulting sheet-read round trips for home_ as 1 (or 3 for memo-only).
