@@ -1,8 +1,23 @@
 # Cost model: where the seconds go in a GAS web app
 
-All numbers below were measured on production scripts (Workspace account, V8 runtime,
-Tokyo region users, 2026-08 to 2026-10). Your numbers will differ by ±50 %; the
-_ratios_ will not.
+All numbers below were measured on two production scripts (Workspace account, V8
+runtime, Tokyo-region users, 2026-08 to 2026-10) by wrapping calls in `Date.now()` and
+logging the deltas; sample sizes were dozens of requests per case, not thousands.
+Treat them as the shape of the problem, not as constants. SpreadsheetApp also does some
+prefetching and write batching of its own, so "one method call = one wire round trip"
+is an approximation that held in these cases.
+
+Two boundaries to keep in mind:
+
+- **Writes are buffered.** Consecutive `setValue`/`setNumberFormat`/`setFontWeight`
+  calls are queued and sent together at the next read, at `SpreadsheetApp.flush()`, or at
+  script end. Our per-call timings were taken with a read between calls, which forces a
+  flush each time — that is also what most real handlers do (read, write, read…), so the
+  numbers are representative of interleaved code, not of a pure write burst.
+- **Row count stops being free somewhere in the thousands.** 7 vs 211 rows made no
+  difference. An append-only log (clock-ins, chat history) that grows to 5,000–30,000
+  rows, especially with `Date` cells, takes seconds per full read even in one call. Keep
+  such sheets out of the all-sheets snapshot: split by month, or read a tail range.
 
 ## SpreadsheetApp: you pay per call, not per row
 
@@ -26,9 +41,10 @@ Consequences:
   spent ~3 s before any business logic.
 - `if (sheet.getLastRow() < 2) return []` is a 60 ms tax to avoid a 70 ms read. Use
   `getDataRange().getValues()` and check `.length`.
-- Indexes, sorting, narrower column ranges, "only read the rows I need" — none of these
-  reduce the _count_. They are the optimizations people reach for because they are what
-  works in SQL. Here they are noise.
+- Indexes, sorting, narrower ranges, "only read the rows I need" reduce bytes, not
+  calls. In the 7–211-row range we measured they changed little; the call count changed
+  everything. Past tens of thousands of rows the balance shifts and range size matters
+  again.
 
 ## Sheets Advanced Service: one call for every sheet
 
@@ -37,7 +53,14 @@ names returned in **270–445 ms total**, one round trip, no `openById`. In a LI
 reply-context handler this took ~14 SpreadsheetApp calls (2.3–4.2 s server-side) down to
 1 call; end-to-end latency went from 6.9–95.7 s (including bad days) to 1.66–3.39 s.
 
-Enable it in `appsscript.json`; no GCP console visit, no extra OAuth prompt:
+Enable it in `appsscript.json`. With the script's **default** Cloud project the API is
+switched on automatically; with a **standard** (user-managed) GCP project you must
+enable the Sheets API in the console first. Whether anyone sees a new OAuth prompt depends
+on the scopes already granted. Two cases do need attention: a script annotated
+`@OnlyCurrentDoc` (scope `spreadsheets.currentonly`) gets `403 Insufficient Permission`
+from the Advanced Service until it is widened, and a project that lists `oauthScopes`
+explicitly in `appsscript.json` must add `https://www.googleapis.com/auth/spreadsheets`
+(or `.readonly`) there — which triggers a re-authorization by the deploying owner.
 
 ```json
 "dependencies": {
@@ -47,8 +70,9 @@ Enable it in `appsscript.json`; no GCP console visit, no extra OAuth prompt:
 }
 ```
 
-Calling the REST endpoint through `UrlFetchApp` instead gives `403 Sheets API has not
-been used in project…` — that path does need the console. Use the Advanced Service.
+Calling the REST endpoint through `UrlFetchApp` with the script's OAuth token gave us
+`403 Sheets API has not been used in project…` on a default project — that path needs
+the console. Use the Advanced Service.
 
 ## UrlFetchApp to another Apps Script
 
@@ -65,9 +89,11 @@ demand.
 
 ## LockService
 
-`waitLock(20000)` means a tap can sit 20 s behind another user's slow handler. The
-fix is not a shorter timeout (that creates "it saved but said it failed" bugs); it is
-holding the lock for the re-read + decide + write only (typically < 400 ms).
+`waitLock(20000)` means a tap can sit 20 s behind another user's slow handler. An
+attempt whose `waitLock` times out never reaches the write, so shortening the timeout by
+itself does not create lost writes — but the client will retry, and the _previous_
+attempt may have written. Hence: hold the lock only for invalidate + re-read + decide +
+write + `flush()` (typically < 400 ms), and make the retry idempotent by `rid` in the row.
 
 ## The /exec path and cold starts
 
@@ -78,8 +104,9 @@ answers 404 for a request that **did execute** — a write can succeed while the
 sees an error. Two consequences:
 
 1. Retrying a write must be idempotent by request id anchored to the written row.
-2. Firing five requests in parallel on page load spins up several containers and
-   makes the 404 more likely. One request per screen is both faster and safer.
+2. Firing five requests in parallel on page load means five auth reads and five
+   independent chances at that 404. We did not establish that parallel calls cause more
+   cold containers; we did see that one `boot` request is faster and simpler to retry.
 
 This layer is real and worth measuring (`measuring.md`), but it is a 1–3 s constant.
 When a page takes 10–20 s, it is the counts above, not this.

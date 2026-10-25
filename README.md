@@ -35,14 +35,27 @@ node scripts/audit.mjs path/to/google-apps-script \
 
 ```
 function          rpc  total  batch  loop  fetch  drive  inLock  readRows_  heaviest callees
-home_               0     76           N×      2                        16  getWishes_×1=32, companiesOf_×2=12, …
-timecardPunch_      1    108           N×      4      4      85          7  timecardAfter_×3=87, myShifts_×1=9, …
+home_               0     66           N×      2                        16  getWishes_×1=27, companiesOf_×2=12, …
+timecardPunch_      0     69           N×      4      8      61          7  timecardAfter_×3=54, myShifts_×1=6, …
 ```
 
-Read it as: `home_` ends up calling `readRows_` 16 times; `timecardPunch_` does 85 round
-trips while holding the lock, including 4 Drive calls. The counter is static (it over-counts
-branches and flags loops rather than multiplying them) — it is the _before_; production
-marks (`references/measuring.md`) are the _after_.
+Read it as: `home_` ends up calling `readRows_` 16 times; `timecardPunch_` has ~60 service
+call sites reachable while holding the lock, including Drive calls. The counter is static —
+a ruler, not a profiler. It is the _before_; production marks (`references/measuring.md`)
+are the _after_.
+
+### Known gaps of the auditor (contributions welcome)
+
+- Counts every branch of `if/else` and `try/catch`; flags loops (`N×`) instead of
+  multiplying. Use `--cost helper=N` to tell it what the hot path really costs.
+- Sees `function name(…)`, `OBJ.prop = function (…)` and `var f = function (…)`. Arrow
+  functions, object-literal methods, class methods and functions passed by reference
+  (`.forEach(readRows_)`, `HANDLERS[action](…)`) are not resolved as callees.
+- Method names are matched textually: a custom object with a `getValues()` method counts
+  as a sheet call. Template-literal interpolations are blanked with the string.
+- Treats `.gs`/`.js` as deployed GAS code; it does not resolve ES-module imports. Audit
+  the bundled output, not the source tree.
+- `PropertiesService` and `CacheService` calls are not counted yet.
 
 ## Layout
 

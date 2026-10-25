@@ -2,8 +2,12 @@ schema_version: "1.1"
 name: lock-scope-clock-in
 expected_outcome: |
   punch.gs saves the photo to Drive and sends the notification outside the lock, holds
-  the lock only for re-reading today's punches, dedupe check and the single appendRow,
-  anchors retry-dedupe to the written row (rid stored in the row, or cache marked after
-  the write) rather than marking CacheService before the lock, and returns only the new
-  punch (not a rebuilt month view) from the write path. notes.md explains why each slow
-  step is outside the lock and why marking "seen" before writing produces false "ok".
+  the lock only for invalidating any cached snapshot, re-reading the punches sheet, the
+  dedupe check, the single appendRow and a flush. The retry id (rid) is stored in the
+  punches row and checked inside that same lock; CacheService, if used at all, is only a
+  hint written after the row. The notification is made durable before the lock is
+  released (e.g. a pending flag in the row, or an outbox row written in the same section)
+  rather than queued afterwards. The response still returns today's punches — built from
+  the rows already read inside the lock, not from a second read or a full month rebuild.
+  notes.md explains why each slow step is outside the lock and why marking "seen" before
+  writing (or only in CacheService) produces false "ok" responses.

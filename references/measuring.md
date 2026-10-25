@@ -26,15 +26,20 @@ function doPost(e) {
     mark_("auth");
     var out = dispatch_(body, ctx);
     mark_("handler");
-    out._t = {
-      gas: Date.now() - REQ_T0_,
-      marks: MARKS_,
-      calls: CALLS_,
-      rid: body.rid,
-    };
-    return json_(out);
+    out._t = { marks: MARKS_, calls: CALLS_, rid: body.rid, gas: 0 };
+    JSON.stringify(out); // encode once so the cost is inside `gas`…
+    out._t.gas = Date.now() - REQ_T0_; // …then stamp the total (re-encode is cheap)
+    return ContentService.createTextOutput(JSON.stringify(out)).setMimeType(
+      ContentService.MimeType.JSON,
+    );
   } finally {
-    logTiming_(body.action, body.rid, MARKS_, CALLS_); // ONE write, after the response is built
+    // ONE write, after the response is built. Wrapped: an exception here would replace
+    // the successful response with an error even though the business write happened.
+    // Its own ~100 ms is NOT in `gas` — it shows up in the client's gap; note that in the log,
+    // or use console.log (Cloud Logging) and pay nothing.
+    try {
+      logTiming_(body.action, body.rid, MARKS_, CALLS_);
+    } catch (_) {}
   }
 }
 ```
@@ -45,13 +50,23 @@ Count service calls by wrapping the helpers you already have:
 function sheetRows_(name, cols) { CALLS_++; ... }
 function appendRow_(def, obj)   { CALLS_++; ... }
 function withLock_(fn) {
-  var t = Date.now(); lock.waitLock(20000); mark_("lock_wait");
-  try { return fn(); } finally { lock.releaseLock(); mark_("lock_held"); }
+  var lock = LockService.getScriptLock();
+  var t0 = Date.now();
+  lock.waitLock(20000);
+  var t1 = Date.now();
+  if (MARKS_) MARKS_.lock_wait_ms = t1 - t0;       // durations, not timestamps
+  try { return fn(); }
+  finally {
+    SpreadsheetApp.flush();
+    lock.releaseLock();
+    if (MARKS_) MARKS_.lock_held_ms = Date.now() - t1;
+  }
 }
 ```
 
-Record **lock wait** and **lock held** separately. Wait is other people's problem
-leaking into this request; held is this request's problem leaking into other people's.
+Record **lock wait** and **lock held** separately, as durations. Wait is other people's
+problem leaking into this request; held is this request's problem leaking into other
+people's.
 
 ### Where to log
 
@@ -62,8 +77,13 @@ Either:
   ~100 ms, acceptable for a week of measurement), or
 - `console.log(JSON.stringify(...))` to Cloud Logging and query it there (adds nothing).
 
-Log columns: `ts, action, rid, gas_ms, lock_wait_ms, lock_held_ms, calls, cold`
-(`cold = !CacheService.getScriptCache().get("warm")`; set it after).
+Log columns: `ts, action, rid, attempt, gas_ms, lock_wait_ms, lock_held_ms, calls`.
+
+You cannot observe "cold start" from inside the execution; `CacheService` is shared by
+all users and says nothing about the container that ran you. Infer it from the client
+side instead: the `gap` distribution is bimodal (a ~0.5–1 s mode and a ~2–4 s mode), and
+the slow mode correlates with minutes since the script's previous request. Log
+`since_prev_s` from a `PropertiesService` timestamp if you want that column.
 
 ## In the browser: wrap the API client
 
@@ -72,32 +92,38 @@ async function call(action, payload) {
   const rid = payload.rid || newRid();
   const t0 = performance.now();
   let attempt = 0,
-    res;
+    res,
+    lastAttemptMs = 0;
   for (;;) {
     attempt++;
     const ta = performance.now();
     try {
       res = await postOnce(action, { ...payload, rid });
+      lastAttemptMs = performance.now() - ta;
       break;
     } catch (e) {
+      queueClientLog({ action, rid, attempt, failedAfter: performance.now() - ta, err: String(e) });
       if (attempt >= 3) throw e;
     }
   }
-  const total = performance.now() - t0;
+  const total = performance.now() - t0; // what the user waited, all attempts
   const gas = res._t?.gas ?? null;
   queueClientLog({
     action,
     rid,
     attempt,
     total,
+    lastAttemptMs,
     gas,
-    gap: gas != null ? total - gas : null,
+    gap: gas != null ? lastAttemptMs - gas : null, // compare the SAME attempt's two clocks
   });
   return res;
 }
 ```
 
-`gap` is transport + cold start + redirect. Flush `queueClientLog` to GAS once per
+`gap` is transport + start-up + redirect + the server-side log write, for the attempt
+that succeeded. `total` includes earlier failed attempts; keep them apart or every retry
+looks like a cold start. Flush `queueClientLog` to GAS once per
 minute or on page hide — never one request per log line.
 
 For the clock-in screen, also mark `gps_ms` (from tap to usable fix) and `photo_ms`.
@@ -112,8 +138,8 @@ Group by action. For each: p50, p95, max, failure rate, n. Then split:
 | `gas` high, `calls` high                  | Count problem                           | batchGet, memo (`batchget.md`)          |
 | `gas` high, `calls` low, `lock_wait` high | Someone else's handler is slow          | Shrink _their_ lock (`patterns.md` §3)  |
 | `gas` high, `calls` low, `lock_held` high | This handler does slow work in the lock | Move Drive/fetch out                    |
-| `gas` low, `gap` high, `cold` true        | Cold start / `/exec` path               | Accept, or move that one action off GAS |
-| `gas` low, `gap` high, `cold` false       | Network/redirect/parallel storms        | One request per screen                  |
+| `gas` low, `gap` high, bimodal and worse after idle | Start-up / `/exec` path | Accept, or move that one action off GAS |
+| `gas` low, `gap` high, flat distribution | Network/redirect, or parallel requests contending | One request per screen; check the client's retry/timeout policy |
 | `total` fine, user still complains        | `client_prep`                           | Overlap GPS/camera with the request     |
 
 Keep a week of data before deciding anything structural. Weekday/weekend and
