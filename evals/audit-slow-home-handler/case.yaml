@@ -1,0 +1,10 @@
+schema_version: "1.1"
+name: audit-slow-home-handler
+expected_outcome: |
+  analysis.md states that home_ reaches readRows_ 8 times (companiesOf_ twice × 2 reads,
+  listPayslips_ 2, docsList_ 2) over 4 distinct sheets, attributes the cost to repeated
+  reads of the same sheets rather than to data volume or cold start, recommends a
+  request-scope memo then a Sheets batchGet, and gives the after number as 1 round trip
+  (one batchGet) for the sheet reads. It does not recommend moving to a database.
+context:
+  scaffold_script: place-files.sh

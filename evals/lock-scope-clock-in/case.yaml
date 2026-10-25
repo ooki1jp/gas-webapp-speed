@@ -1,0 +1,9 @@
+schema_version: "1.1"
+name: lock-scope-clock-in
+expected_outcome: |
+  punch.gs saves the photo to Drive and sends the notification outside the lock, holds
+  the lock only for re-reading today's punches, dedupe check and the single appendRow,
+  anchors retry-dedupe to the written row (rid stored in the row, or cache marked after
+  the write) rather than marking CacheService before the lock, and returns only the new
+  punch (not a rebuilt month view) from the write path. notes.md explains why each slow
+  step is outside the lock and why marking "seen" before writing produces false "ok".
